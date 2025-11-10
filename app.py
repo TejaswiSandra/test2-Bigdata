@@ -1,294 +1,216 @@
-# app.py — Streamlit dashboard for Azure Cosmos DB (Mongo API) — sample_mflix
-
 import os
+import math
 from datetime import datetime
 import pandas as pd
+import plotly.express as px
 import streamlit as st
-import altair as alt
 from pymongo import MongoClient
-from dotenv import load_dotenv
 
-# -----------------------------
-# Page config
-# -----------------------------
-st.set_page_config(page_title="Mflix Dashboard", layout="wide")
-st.title("🎬 Mflix Metrics — Azure Cosmos DB (Mongo API)")
-
-# -----------------------------
-# Connection (uses .env if present, else fallback)
-# -----------------------------
-load_dotenv()
+# -------------------- CONFIG --------------------
+st.set_page_config(page_title="sample_mflix — Cloud Dashboard", layout="wide")
 
 URI = os.getenv(
     "MONGO_URI",
-    # Fallback to your working URI (note the URL-encoded @ -> %40)
+    # fallback (URL-encoded @ -> %40)
     "mongodb+srv://tejaswisandratest2:password%40123@test2-bd.mongocluster.cosmos.azure.com/sample_mflix"
     "?tls=true&authMechanism=SCRAM-SHA-256&retrywrites=false&maxIdleTimeMS=120000"
 )
 DB_NAME = os.getenv("MONGO_DB", "sample_mflix")
 
-@st.cache_resource(show_spinner=True)
-def get_db():
-    client = MongoClient(URI, serverSelectionTimeoutMS=20000)
-    client.admin.command("ping")  # sanity check
-    return client[DB_NAME]
+# -------------------- HELPERS --------------------
+@st.cache_resource(show_spinner=False)
+def get_client():
+    # Cosmos requires TLS 1.2+ and SCRAM-SHA-256
+    return MongoClient(URI, serverSelectionTimeoutMS=20000)
 
-try:
-    db = get_db()
-    st.success(f"Connected to **{DB_NAME}** ✅")
-except Exception as e:
-    st.error(f"❌ Failed to connect to database: {e}")
-    st.stop()
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def to_df(cursor_or_iterable, drop_id=True):
-    rows = list(cursor_or_iterable)
-    if not rows:
+@st.cache_data(show_spinner=False)
+def agg_to_df(col, pipeline):
+    db = get_client()[DB_NAME]
+    docs = list(db[col].aggregate(pipeline, allowDiskUse=True))
+    if not docs:
         return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    if drop_id and "_id" in df.columns:
-        df = df.drop(columns=["_id"])
-    # stringify any datetime objects for display
-    for c in df.columns:
-        if df[c].dtype == "object" and df[c].apply(lambda x: isinstance(x, datetime)).any():
-            df[c] = df[c].astype(str)
-    return df
+    return pd.json_normalize(docs)
 
-@st.cache_data(ttl=60)
-def list_genres():
-    pipeline = [
-        {"$unwind": "$genres"},
-        {"$group": {"_id": "$genres"}},
-        {"$project": {"_id": 0, "genre": "$_id"}},
-        {"$sort": {"genre": 1}},
-    ]
-    return [g["genre"] for g in db.movies.aggregate(pipeline)]
-
-@st.cache_data(ttl=60)
-def years_min_max():
-    doc = db.movies.aggregate([
-        {"$match": {"year": {"$exists": True}}},
-        {"$group": {"_id": None, "minY": {"$min": "$year"}, "maxY": {"$max": "$year"}}}
-    ])
-    d = next(doc, None)
-    if not d or d["minY"] is None or d["maxY"] is None:
-        return (2000, 2025)
+def safe_year(x):
     try:
-        return (int(d["minY"]), int(d["maxY"]))
+        return int(x)
     except Exception:
-        return (2000, 2025)
+        return None
 
-# -----------------------------
-# Sidebar Filters
-# -----------------------------
-st.sidebar.header("Filters")
+# -------------------- SIDEBAR --------------------
+st.sidebar.title("Filters")
 
-ymin, ymax = years_min_max()
-if ymin > ymax:
-    ymin, ymax = 2000, 2025
+# Basic metadata
+with st.sidebar.expander("Connection", expanded=False):
+    st.write(f"**DB**: `{DB_NAME}`")
+    st.write("**Host**: Azure Cosmos DB (Mongo API)")
 
-year_range = st.sidebar.slider("Year range", min_value=int(ymin), max_value=int(ymax),
-                               value=(int(ymin), int(ymax)), step=1)
+# Year range for charts
+years_df = agg_to_df("movies", [
+    {"$match": {"year": {"$type": "number"}}},
+    {"$group": {"_id": None, "miny": {"$min": "$year"}, "maxy": {"$max": "$year"}}}
+])
+miny = int(years_df["miny"].iloc[0]) if not years_df.empty else 1900
+maxy = int(years_df["maxy"].iloc[0]) if not years_df.empty else 2020
+yr_range = st.sidebar.slider("Year range", min_value=miny, max_value=maxy, value=(max(miny, 1930), maxy), step=1)
 
-all_genres = list_genres()
-default_genres = all_genres[:3] if all_genres else []
-sel_genres = st.sidebar.multiselect("Genres", options=all_genres, default=default_genres)
+# Genre filter
+genres_df = agg_to_df("movies", [
+    {"$unwind": "$genres"},
+    {"$group": {"_id": {"$toLower": "$genres"}, "n": {"$sum": 1}}},
+    {"$sort": {"n": -1}},
+    {"$limit": 30},
+    {"$project": {"_id": 0, "genre": "$_id", "n": 1}}
+])
+genre_opts = genres_df["genre"].tolist() if not genres_df.empty else []
+sel_genres = st.sidebar.multiselect("Genres (top 30)", options=genre_opts, default=[])
 
-min_rating = st.sidebar.slider("Min IMDb rating", 0.0, 10.0, 6.0, 0.1)
+# -------------------- HEADER --------------------
+st.title("🎬 sample_mflix — Cloud Analytics Dashboard")
+st.caption("Backed by Azure Cosmos DB for MongoDB (vCore). This dashboard reads live data using MQL aggregations.")
 
-# -----------------------------
-# Queries
-# -----------------------------
-@st.cache_data(ttl=60)
-def movies_filtered(year_min, year_max, genres, min_r):
-    match_stage = {
-        "$and": [
-            {"year": {"$gte": year_min, "$lte": year_max}},
-            {"imdb.rating": {"$type": "number", "$gte": float(min_r)}},
-        ]
-    }
-    if genres:
-        match_stage["$and"].append({"genres": {"$in": genres}})
-    cur = db.movies.find(
-        match_stage,
-        {"title": 1, "year": 1, "genres": 1, "imdb.rating": 1, "countries": 1}
-    ).sort([("imdb.rating", -1), ("year", -1)]).limit(1000)
-    df = to_df(cur, drop_id=True)
-    # Type coercion
-    if "year" in df.columns:
-        df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("float64")
-    if "imdb.rating" in df.columns:
-        df["imdb.rating"] = pd.to_numeric(df["imdb.rating"], errors="coerce").astype("float64")
-    return df
+# -------------------- KPI CARDS --------------------
+kpi_row = st.container()
+with kpi_row:
+    col1, col2, col3, col4 = st.columns(4)
 
-@st.cache_data(ttl=60)
-def agg_avg_rating_by_year(year_min, year_max, genres, min_r):
-    match = {
-        "year": {"$gte": year_min, "$lte": year_max},
-        "imdb.rating": {"$type": "number", "$gte": float(min_r)},
-    }
-    if genres:
-        match["genres"] = {"$in": genres}
-    pipeline = [
-        {"$match": match},
-        {"$group": {"_id": "$year", "avgRating": {"$avg": "$imdb.rating"}, "n": {"$sum": 1}}},
-        {"$sort": {"_id": 1}}
-    ]
-    df = to_df(db.movies.aggregate(pipeline), drop_id=False)
-    # rename and cast
-    if "_id" in df.columns:
-        df = df.rename(columns={"_id": "year"})
-    for col in ("year", "avgRating", "n"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
-    df = df.dropna(subset=["year", "avgRating"])
-    return df
+    movies_kpi = agg_to_df("movies", [{"$count": "n"}])
+    comments_kpi = agg_to_df("comments", [{"$count": "n"}])
+    users_kpi = agg_to_df("users", [{"$count": "n"}])
 
-@st.cache_data(ttl=60)
-def agg_movies_by_genre(year_min, year_max, min_r):
-    pipeline = [
-        {"$match": {
-            "year": {"$gte": year_min, "$lte": year_max},
-            "imdb.rating": {"$type": "number", "$gte": float(min_r)},
-            "genres": {"$ne": None}
-        }},
-        {"$unwind": "$genres"},
-        {"$group": {"_id": "$genres", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}}
-    ]
-    df = to_df(db.movies.aggregate(pipeline), drop_id=False)
-    if "_id" in df.columns:
-        df = df.rename(columns={"_id": "genre"})
-    if "count" in df.columns:
-        df["count"] = pd.to_numeric(df["count"], errors="coerce").astype("float64")
-    return df
+    n_movies = int(movies_kpi["n"].iloc[0]) if not movies_kpi.empty else 0
+    n_comments = int(comments_kpi["n"].iloc[0]) if not comments_kpi.empty else 0
+    n_users = int(users_kpi["n"].iloc[0]) if not users_kpi.empty else 0
 
-@st.cache_data(ttl=60)
-def comments_over_time():
-    pipeline = [
-        {"$project": {"date": 1}},
-        {"$match": {"date": {"$type": "date"}}},
-        {"$group": {
-            "_id": {"$dateTrunc": {"date": "$date", "unit": "day"}},
-            "comments": {"$sum": 1}
-        }},
-        {"$sort": {"_id": 1}}
-    ]
-    df = to_df(db.comments.aggregate(pipeline), drop_id=False)
-    if "_id" in df.columns:
-        df = df.rename(columns={"_id": "date"})
-    # Coerce to datetime for plotting
-    if "date" in df.columns:
-        try:
-            df["date"] = pd.to_datetime(df["date"])
-        except Exception:
-            pass
-    if "comments" in df.columns:
-        df["comments"] = pd.to_numeric(df["comments"], errors="coerce").astype("float64")
-    return df
+    # distinct directors
+    dir_kpi = agg_to_df("movies", [
+        {"$unwind": {"path": "$directors", "preserveNullAndEmptyArrays": False}},
+        {"$group": {"_id": {"$toLower": "$directors"}}},
+        {"$count": "n"}
+    ])
+    n_directors = int(dir_kpi["n"].iloc[0]) if not dir_kpi.empty else 0
 
-# Execute with filters
-movies_df = movies_filtered(year_range[0], year_range[1], sel_genres, min_rating)
-avg_year_df = agg_avg_rating_by_year(year_range[0], year_range[1], sel_genres, min_rating)
-genre_df = agg_movies_by_genre(year_range[0], year_range[1], min_rating)
-comments_df = comments_over_time()
+    col1.metric("🎞️ Movies", f"{n_movies:,}")
+    col2.metric("💬 Comments", f"{n_comments:,}")
+    col3.metric("👥 Users", f"{n_users:,}")
+    col4.metric("🎬 Directors", f"{n_directors:,}")
 
-# -----------------------------
-# KPIs
-# -----------------------------
-col1, col2, col3 = st.columns(3)
-col1.metric("Movies (filtered)", int(len(movies_df)))
-col2.metric("Genres w/ matches", int(len(genre_df)))
-col3.metric("Comments (all time)", 0 if comments_df.empty else int(comments_df["comments"].sum()))
+st.markdown("---")
 
-# -----------------------------
-# Top Movies Table
-# -----------------------------
-st.subheader("⭐ Top Movies (Filtered)")
-if movies_df.empty:
-    st.info("No movies match the current filters.")
+# -------------------- MOVIES PER YEAR --------------------
+st.subheader("Movies per Year")
+match_stage = {"$match": {"year": {"$type": "number", "$gte": yr_range[0], "$lte": yr_range[1]}}}
+if sel_genres:
+    match_stage["$match"]["genres"] = {"$in": sel_genres}
+
+per_year = agg_to_df("movies", [
+    match_stage,
+    {"$group": {"_id": "$year", "titles": {"$sum": 1}}},
+    {"$project": {"_id": 0, "year": "$_id", "titles": 1}},
+    {"$sort": {"year": 1}}
+])
+if per_year.empty:
+    st.info("No data for chosen filters.")
 else:
-    pretty = movies_df.rename(columns={"imdb.rating": "rating"})
-    st.dataframe(pretty.head(25), use_container_width=True)
+    fig = px.line(per_year, x="year", y="titles", markers=True, title=None)
+    fig.update_layout(height=360, margin=dict(l=0, r=0, t=0, b=0))
+    st.plotly_chart(fig, use_container_width=True)
 
-# -----------------------------
-# Average IMDb Rating by Year (ROBUST)
-# -----------------------------
-st.subheader("📈 Average IMDb Rating by Year")
-
-# Keep only needed columns, already renamed inside agg function
-needed_cols = [c for c in ["year", "avgRating", "n"] if c in avg_year_df.columns]
-avg_year_df = avg_year_df[needed_cols].copy() if needed_cols else pd.DataFrame(columns=["year","avgRating","n"])
-
-# Ensure numeric types (avoid nullable ints)
-for c in ("year", "avgRating", "n"):
-    if c in avg_year_df.columns:
-        avg_year_df[c] = pd.to_numeric(avg_year_df[c], errors="coerce").astype("float64")
-
-avg_year_df = avg_year_df.dropna(subset=["year", "avgRating"])
-
-if avg_year_df.empty:
-    st.info("No numeric data available to plot average rating by year with the current filters.")
+# -------------------- TOP GENRES --------------------
+st.subheader("Top Genres")
+match_g = {"$match": {"genres": {"$type": "array"}}}
+if sel_genres:
+    match_g["$match"]["genres"]["$in"] = sel_genres
+top_gen = agg_to_df("movies", [
+    match_g,
+    {"$unwind": "$genres"},
+    {"$group": {"_id": {"$toLower": "$genres"}, "n": {"$sum": 1}}},
+    {"$project": {"_id": 0, "genre": "$_id", "n": 1}},
+    {"$sort": {"n": -1}},
+    {"$limit": 15}
+])
+if not top_gen.empty:
+    fig = px.bar(top_gen, x="n", y="genre", orientation="h", title=None)
+    fig.update_layout(height=500, margin=dict(l=0, r=0, t=0, b=0))
+    st.plotly_chart(fig, use_container_width=True)
 else:
-    # Using ordinal x is more robust when dtype inference is tricky; switch to ':Q' if you prefer numeric axis
-    chart1 = (
-        alt.Chart(avg_year_df)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("year:O", title="Year"),
-            y=alt.Y("avgRating:Q", title="Average IMDb rating"),
-            tooltip=["year", "avgRating", "n"]
-        )
-        .properties(height=300)
-    )
-    st.altair_chart(chart1, use_container_width=True)
+    st.info("No genre data for filters.")
 
-# -----------------------------
-# Movies by Genre
-# -----------------------------
-st.subheader("🎭 Movies by Genre (Count)")
-if genre_df.empty or "genre" not in genre_df.columns or "count" not in genre_df.columns:
-    st.info("No genres to display.")
-    if not genre_df.empty:
-        st.dataframe(genre_df)
+# -------------------- RATING DISTRIBUTION --------------------
+st.subheader("IMDb Rating Distribution")
+rating_match = {"$match": {"imdb.rating": {"$type": "number"}}}
+if sel_genres:
+    rating_match["$match"]["genres"] = {"$in": sel_genres}
+rating_hist = agg_to_df("movies", [
+    rating_match,
+    {"$project": {"r": "$imdb.rating"}},
+    {"$bucket": {
+        "groupBy": "$r",
+        "boundaries": [i/2 for i in range(0, 21)],  # 0.0..10.0 step 0.5
+        "default": "other",
+        "output": {"n": {"$sum": 1}}
+    }},
+    {"$project": {"bucket": {"$toString": "$_id"}, "n": 1, "_id": 0}},
+    {"$match": {"bucket": {"$ne": "other"}}},
+    {"$sort": {"bucket": 1}}
+])
+if not rating_hist.empty:
+    rating_hist["bucket"] = rating_hist["bucket"].astype(str)
+    fig = px.bar(rating_hist, x="bucket", y="n", labels={"bucket": "IMDb rating (0.5 bins)", "n": "# Movies"})
+    fig.update_layout(height=360, margin=dict(l=0, r=0, t=0, b=0))
+    st.plotly_chart(fig, use_container_width=True)
 else:
-    chart2 = (
-        alt.Chart(genre_df.head(20))
-        .mark_bar()
-        .encode(
-            x=alt.X("count:Q", title="Count"),
-            y=alt.Y("genre:N", sort="-x", title="Genre"),
-            tooltip=["genre", "count"]
-        )
-        .properties(height=400)
-    )
-    st.altair_chart(chart2, use_container_width=True)
+    st.info("No rating data available.")
 
-# -----------------------------
-# Comments Over Time
-# -----------------------------
-st.subheader("💬 Comments Over Time")
-if comments_df.empty or "date" not in comments_df.columns or "comments" not in comments_df.columns:
-    st.info("No comment timestamps yet. Insert a few in `comments` with a `date` field to see this fill.")
+# -------------------- COMMENTS OVER TIME --------------------
+st.subheader("Comments per Month")
+cmt = agg_to_df("comments", [
+    {"$match": {"date": {"$type": "date"}}},
+    {"$project": {"ym": {"$dateToString": {"date": "$date", "format": "%Y-%m"}}}},
+    {"$group": {"_id": "$ym", "n": {"$sum": 1}}},
+    {"$project": {"_id": 0, "ym": "$_id", "n": 1}},
+    {"$sort": {"ym": 1}}
+])
+if not cmt.empty:
+    cmt["ym"] = pd.to_datetime(cmt["ym"] + "-01", errors="coerce")
+    fig = px.line(cmt, x="ym", y="n", markers=True, labels={"ym": "Year-Month", "n": "Comments"})
+    fig.update_layout(height=360, margin=dict(l=0, r=0, t=0, b=0))
+    st.plotly_chart(fig, use_container_width=True)
 else:
-    chart3 = (
-        alt.Chart(comments_df)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("date:T", title="Date"),
-            y=alt.Y("comments:Q", title="Comments"),
-            tooltip=["date", "comments"]
-        )
-        .properties(height=300)
-    )
-    st.altair_chart(chart3, use_container_width=True)
+    st.info("No comments or missing dates.")
 
-# -----------------------------
-# Raw Explorer
-# -----------------------------
-with st.expander("🔎 Raw Explorer — First 100 filtered movies"):
-    st.dataframe(movies_df.head(100), use_container_width=True)
+# -------------------- TOP DIRECTORS --------------------
+st.subheader("Top Directors by Number of Titles")
+top_dir = agg_to_df("movies", [
+    {"$unwind": {"path": "$directors", "preserveNullAndEmptyArrays": False}},
+    {"$group": {"_id": {"$toLower": "$directors"}, "titles": {"$sum": 1}}},
+    {"$project": {"_id": 0, "director": "$_id", "titles": 1}},
+    {"$sort": {"titles": -1}},
+    {"$limit": 15}
+])
+if not top_dir.empty:
+    fig = px.bar(top_dir, x="titles", y="director", orientation="h")
+    fig.update_layout(height=500, margin=dict(l=0, r=0, t=0, b=0))
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("No director data.")
 
-st.caption("Backend: Azure Cosmos DB (Mongo API) • Secure TLS connection • SRV URI")
+# -------------------- VOTES vs RATING --------------------
+st.subheader("IMDb Votes vs Rating (Top by votes)")
+scatter = agg_to_df("movies", [
+    {"$match": {"imdb.rating": {"$type": "number"}, "imdb.votes": {"$type": "number"}}},
+    {"$project": {"rating": "$imdb.rating", "votes": "$imdb.votes", "title": "$title"}},
+    {"$sort": {"votes": -1}},
+    {"$limit": 1500}
+])
+if not scatter.empty:
+    fig = px.scatter(scatter, x="rating", y="votes", hover_data=["title"], trendline="ols",
+                     labels={"rating": "IMDb rating", "votes": "Votes"})
+    fig.update_layout(height=450, margin=dict(l=0, r=0, t=0, b=0))
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("Votes/rating not available.")
+
+# -------------------- FOOTER --------------------
+st.markdown("---")
+st.caption("Tip: change filters in the sidebar to explore by year range and genres. Data source: Azure Cosmos DB (Mongo API).")
