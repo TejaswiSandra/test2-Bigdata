@@ -4,3 +4,5 @@ pandas
 altair
 python-dotenv
 plotly>=5.0.0
+statsmodels>=0.13
+
