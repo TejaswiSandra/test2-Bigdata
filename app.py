@@ -204,7 +204,7 @@ scatter = agg_to_df("movies", [
     {"$limit": 1500}
 ])
 if not scatter.empty:
-    fig = px.scatter(scatter, x="rating", y="votes", hover_data=["title"], trendline="ols",
+    fig = px.scatter(scatter, x="rating", y="votes", hover_data=["title"], 
                      labels={"rating": "IMDb rating", "votes": "Votes"})
     fig.update_layout(height=450, margin=dict(l=0, r=0, t=0, b=0))
     st.plotly_chart(fig, use_container_width=True)
@@ -214,3 +214,4 @@ else:
 # -------------------- FOOTER --------------------
 st.markdown("---")
 st.caption("Tip: change filters in the sidebar to explore by year range and genres. Data source: Azure Cosmos DB (Mongo API).")
+
