@@ -3,3 +3,4 @@ pymongo
 pandas
 altair
 python-dotenv
+plotly>=5.0.0
